@@ -2,16 +2,37 @@
 # Copy this to ~/.overseer-env and fill in your values
 # Then: source ~/.overseer-env && python3 voice-interface.py
 
+# ── Required ──────────────────────────────────────────────────────
+
 # Groq API key (free at https://console.groq.com)
 export GROQ_API_KEY="gsk_your_key_here"
 
-# Pi connection (Tailscale hostname)
-export PI_HOST="raspberrypi"
-export PI_USER="mykyta-g"
+# Picovoice API key (free at https://console.picovoice.ai)
+export PICOVOICE_API_KEY="your_picovoice_key_here"
 
 # Clawdbot gateway auth token (from gateway config)
 export GATEWAY_TOKEN="your_gateway_token_here"
 
-# macOS TTS voice (run `say -v ?` to list available voices)
-# Good options: Samantha, Alex, Daniel (British), Karen (Australian)
+# ── Pi Connection ─────────────────────────────────────────────────
+
+export PI_HOST="raspberrypi"
+export PI_USER="mykyta-g"
+
+# ── Wake Word ─────────────────────────────────────────────────────
+
+# Custom wake word .ppn file (train at console.picovoice.ai)
+# Leave empty to use built-in keyword
+export WAKE_WORD_PATH=""
+
+# Built-in keyword fallback (jarvis, alexa, hey google, etc.)
+export WAKE_WORD_BUILTIN="jarvis"
+
+# ── Tabbie ────────────────────────────────────────────────────────
+
+export TABBIE_HOST="tabbie.local"
+export TABBIE_ENABLED="true"
+
+# ── TTS ───────────────────────────────────────────────────────────
+
+# macOS voice (run `say -v ?` to list available voices)
 export TTS_VOICE="Samantha"
