@@ -1,0 +1,17 @@
+# Overseer Voice Interface — Environment Variables
+# Copy this to ~/.overseer-env and fill in your values
+# Then: source ~/.overseer-env && python3 voice-interface.py
+
+# Groq API key (free at https://console.groq.com)
+export GROQ_API_KEY="gsk_your_key_here"
+
+# Pi connection (Tailscale hostname)
+export PI_HOST="raspberrypi"
+export PI_USER="mykyta-g"
+
+# Clawdbot gateway auth token (from gateway config)
+export GATEWAY_TOKEN="your_gateway_token_here"
+
+# macOS TTS voice (run `say -v ?` to list available voices)
+# Good options: Samantha, Alex, Daniel (British), Karen (Australian)
+export TTS_VOICE="Samantha"
