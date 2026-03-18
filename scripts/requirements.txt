@@ -5,3 +5,4 @@ numpy>=1.24.0
 keyboard>=0.13.5
 pvporcupine>=3.0.0
 pvrecorder>=1.2.0
+edge-tts>=6.1.0

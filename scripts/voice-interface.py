@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Overseer Voice Interface
-========================
-Wake word "Overseer" or hold SPACE to talk. Voice in, voice out.
+Overseer Voice Interface v2
+===========================
+Wake word → listen → Groq STT → Haiku streaming → Edge TTS → interrupt support
 
-Modes:
-    --wake-word    Always listening for wake word (default)
-    --push-to-talk Hold SPACE to record
-
-Requirements (Mac):
-    pip3 install requests sounddevice numpy keyboard pvporcupine pvrecorder
+Optimizations:
+    1. Direct Anthropic API (no SSH overhead)
+    2. Streaming responses (speak first sentence while generating rest)
+    3. Edge TTS neural voices (free, human-quality)
+    4. Interrupt support (speak over Overseer to stop it)
 
 Usage:
     python3 voice-interface.py                    # Wake word mode
     python3 voice-interface.py --push-to-talk     # Fallback: hold SPACE
+    python3 voice-interface.py --no-tabbie        # Disable Tabbie face
 """
 
 import os
@@ -21,562 +21,691 @@ import sys
 import json
 import time
 import wave
-import struct
 import tempfile
 import subprocess
 import threading
 import argparse
+import asyncio
+import re
+import signal
+
 import requests
+import numpy as np
+import sounddevice as sd
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 PICOVOICE_API_KEY = os.environ.get("PICOVOICE_API_KEY", "")
-PI_HOST = os.environ.get("PI_HOST", "raspberrypi")
-PI_USER = os.environ.get("PI_USER", "mykyta-g")
-GATEWAY_PORT = 18789
-GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "")
-OVERSEER_AGENT = "overseer"
-HOTKEY = "space"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+HAIKU_MODEL = os.environ.get("HAIKU_MODEL", "claude-haiku-4-5-20250414")
+
+# Wake word
+WAKE_WORD_PATH = os.environ.get("WAKE_WORD_PATH", "")
+WAKE_WORD_BUILTIN = os.environ.get("WAKE_WORD_BUILTIN", "jarvis")
+
+# Audio
 SAMPLE_RATE = 16000
 CHANNELS = 1
+SILENCE_THRESHOLD = 500
+SILENCE_DURATION = 1.2    # faster cutoff for natural feel
+MAX_RECORD_SECONDS = 30
+INTERRUPT_THRESHOLD = 600  # amplitude to trigger interrupt during playback
 
-# Wake word config
-# Use a custom .ppn file trained at console.picovoice.ai, or a built-in keyword
-WAKE_WORD_PATH = os.environ.get("WAKE_WORD_PATH", "")  # path to custom .ppn file
-WAKE_WORD_BUILTIN = os.environ.get("WAKE_WORD_BUILTIN", "jarvis")  # fallback built-in
+# Edge TTS
+TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-GuyNeural")
 
-# Silence detection: stop recording after this many seconds of silence
-SILENCE_THRESHOLD = 500  # amplitude threshold for "silence"
-SILENCE_DURATION = 1.5   # seconds of silence before stopping
-MAX_RECORD_SECONDS = 30  # safety cap
-
-# Tabbie integration
+# Tabbie
 TABBIE_HOST = os.environ.get("TABBIE_HOST", "tabbie.local")
 TABBIE_ENABLED = os.environ.get("TABBIE_ENABLED", "true").lower() == "true"
 
-# TTS
-TTS_VOICE = os.environ.get("TTS_VOICE", "Samantha")
+# Conversation history (for context)
+MAX_HISTORY = 10
+conversation_history = []
 
-# ── Colors ──────────────────────────────────────────────────────────────────
+# Overseer system prompt
+OVERSEER_SYSTEM = """You are Overseer — mission control for an AI agent fleet. You speak out loud via voice.
+
+Personality: Terse, calm, sharp. JARVIS meets senior ops engineer.
+- Keep responses SHORT — you're speaking, not writing an essay
+- 1-3 sentences for simple queries
+- Use natural speech patterns, not bullet points (this is voice, not text)
+- Be warm when it counts, brief always
+- If you don't know something, say so in one sentence
+
+You coordinate these agents:
+- Wizard (Opus) — heavy builds, Simple Schedules project
+- Saul (Opus) — research, legal, LegalBuddy
+- Killer (Sonnet) — fast ops, quick code
+- Gunnar (Haiku) — general tasks
+- Forge (Qwen 3 local) — offline, free
+
+Your human is Mykyta, based in Skåne, Sweden. He's building AI infrastructure on a Raspberry Pi.
+
+Important: You're responding via VOICE. Keep it conversational and natural. No markdown, no bullet points, no code blocks. Just talk like a person."""
+
+# ── Logging ─────────────────────────────────────────────────────────────────
 
 class C:
-    CYAN = "\033[96m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    MAGENTA = "\033[95m"
-    DIM = "\033[2m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
+    CYAN = "\033[96m"; GREEN = "\033[92m"; YELLOW = "\033[93m"
+    RED = "\033[91m"; MAGENTA = "\033[95m"; DIM = "\033[2m"
+    BOLD = "\033[1m"; RESET = "\033[0m"
 
 def log(icon, msg, color=C.RESET):
     print(f"{color}{icon} {msg}{C.RESET}")
 
-# ── Tabbie Integration ──────────────────────────────────────────────────────
+# ── Tabbie ──────────────────────────────────────────────────────────────────
 
-def tabbie_animation(animation: str, task: str = ""):
-    """Send animation command to Tabbie."""
+def tabbie(animation: str, task: str = ""):
     if not TABBIE_ENABLED:
         return
     try:
-        payload = {"animation": animation, "task": task}
-        requests.post(
-            f"http://{TABBIE_HOST}/api/animation",
-            json=payload,
-            timeout=2,
-        )
+        requests.post(f"http://{TABBIE_HOST}/api/animation",
+                      json={"animation": animation, "task": task}, timeout=1)
     except Exception:
-        pass  # Tabbie offline is fine — it's optional
+        pass
 
-def tabbie_status() -> bool:
-    """Check if Tabbie is reachable."""
-    if not TABBIE_ENABLED:
-        return False
+# ── 1. Groq Whisper STT ────────────────────────────────────────────────────
+
+def transcribe(audio_path: str) -> str:
+    """Groq Whisper — ~300ms, free."""
+    log("🧠", "Transcribing...", C.YELLOW)
+    tabbie("focus", "Thinking...")
+
     try:
-        r = requests.get(f"http://{TABBIE_HOST}/api/status", timeout=2)
-        return r.ok
-    except Exception:
-        return False
+        with open(audio_path, "rb") as f:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": ("audio.wav", f, "audio/wav")},
+                data={"model": "whisper-large-v3", "response_format": "json"},
+                timeout=15,
+            )
+        if resp.status_code == 200:
+            text = resp.json().get("text", "").strip()
+            log("📝", f'"{text}"', C.CYAN)
+            return text
+        else:
+            log("❌", f"Groq: {resp.status_code}", C.RED)
+    except Exception as e:
+        log("❌", f"STT error: {e}", C.RED)
+    return ""
+
+# ── 2. Haiku Streaming LLM ─────────────────────────────────────────────────
+
+def stream_haiku(text: str):
+    """Stream response from Haiku. Yields text chunks as they arrive."""
+    global conversation_history
+
+    conversation_history.append({"role": "user", "content": text})
+
+    # Trim history
+    if len(conversation_history) > MAX_HISTORY * 2:
+        conversation_history = conversation_history[-(MAX_HISTORY * 2):]
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": HAIKU_MODEL,
+                "max_tokens": 300,  # Short for voice
+                "system": OVERSEER_SYSTEM,
+                "messages": conversation_history,
+                "stream": True,
+            },
+            stream=True,
+            timeout=30,
+        )
+
+        if resp.status_code != 200:
+            log("❌", f"Haiku: {resp.status_code} {resp.text[:200]}", C.RED)
+            yield "Sorry, I couldn't process that."
+            return
+
+        full_response = ""
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line = line.decode("utf-8")
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+
+            try:
+                event = json.loads(data)
+                if event.get("type") == "content_block_delta":
+                    chunk = event.get("delta", {}).get("text", "")
+                    if chunk:
+                        full_response += chunk
+                        yield chunk
+            except json.JSONDecodeError:
+                continue
+
+        # Save assistant response to history
+        if full_response:
+            conversation_history.append({"role": "assistant", "content": full_response})
+
+    except Exception as e:
+        log("❌", f"LLM error: {e}", C.RED)
+        yield "Connection error. Try again."
+
+# ── 3. Edge TTS with Streaming ──────────────────────────────────────────────
+
+class EdgeTTSPlayer:
+    """Streams Edge TTS audio with interrupt support."""
+
+    def __init__(self):
+        self.playing = False
+        self.interrupted = False
+        self.process = None
+        self._monitor_thread = None
+
+    def speak_sentence(self, text: str) -> bool:
+        """Generate and play one sentence. Returns False if interrupted."""
+        if self.interrupted or not text.strip():
+            return not self.interrupted
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        try:
+            # Generate audio with edge-tts CLI
+            result = subprocess.run(
+                ["edge-tts", "--voice", TTS_VOICE, "--text", text, "--write-media", tmp_path],
+                capture_output=True, timeout=10,
+            )
+
+            if result.returncode != 0 or not os.path.exists(tmp_path):
+                # Fallback to macOS say
+                subprocess.run(["say", "-r", "180", text], timeout=15)
+                return not self.interrupted
+
+            if self.interrupted:
+                return False
+
+            # Play audio
+            self.playing = True
+            # Use afplay on macOS, mpv/ffplay on Linux
+            try:
+                self.process = subprocess.Popen(
+                    ["afplay", tmp_path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                self.process = subprocess.Popen(
+                    ["mpv", "--no-terminal", "--no-video", tmp_path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+
+            self.process.wait()
+            self.playing = False
+
+            return not self.interrupted
+
+        except Exception as e:
+            log("⚠️", f"TTS error: {e}", C.YELLOW)
+            return not self.interrupted
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def stop(self):
+        """Stop playback immediately."""
+        self.interrupted = True
+        self.playing = False
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+    def reset(self):
+        """Reset interrupt state for new conversation turn."""
+        self.interrupted = False
+        self.playing = False
+        self.process = None
+
+# ── 4. Interrupt Monitor ────────────────────────────────────────────────────
+
+class InterruptMonitor:
+    """Monitors mic while TTS plays. Triggers interrupt on loud audio."""
+
+    def __init__(self, tts_player: EdgeTTSPlayer):
+        self.tts = tts_player
+        self.triggered = False
+        self.running = False
+        self._thread = None
+
+    def start(self):
+        """Start monitoring mic for interrupts."""
+        self.triggered = False
+        self.running = True
+        self._thread = threading.Thread(target=self._monitor, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop monitoring."""
+        self.running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _monitor(self):
+        """Background thread: listen for loud audio = interrupt."""
+        try:
+            stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS,
+                dtype="int16", blocksize=2048,
+            )
+            with stream:
+                # Wait a moment for TTS to start playing
+                time.sleep(0.5)
+
+                while self.running and self.tts.playing:
+                    data, _ = stream.read(2048)
+                    amplitude = np.abs(data).mean()
+
+                    if amplitude > INTERRUPT_THRESHOLD:
+                        log("🤚", "Interrupt detected!", C.MAGENTA)
+                        self.triggered = True
+                        self.tts.stop()
+                        self.running = False
+                        return
+
+                    time.sleep(0.05)
+        except Exception:
+            pass
 
 # ── Audio Recording ─────────────────────────────────────────────────────────
 
-class AudioRecorder:
-    """Records audio with silence detection."""
+def record_with_silence() -> str | None:
+    """Record until silence. Returns path to WAV file."""
+    frames = []
+    silence_start = None
+    has_speech = False
+    start_time = time.time()
+    recording = True
 
-    def __init__(self):
-        self.frames = []
-        self.recording = False
-        self.stream = None
+    log("🎙️", "Listening...", C.RED)
+    tabbie("focus", "Listening...")
 
-    def start(self):
-        import sounddevice as sd
+    def callback(indata, frame_count, time_info, status):
+        nonlocal silence_start, has_speech
+        if not recording:
+            return
+        frames.append(indata.copy())
+        amplitude = np.abs(indata).mean()
 
-        self.frames = []
-        self.recording = True
-        log("🎙️", "Listening... (speak now)", C.RED)
-        tabbie_animation("focus", "Listening...")
+        if amplitude > SILENCE_THRESHOLD:
+            has_speech = True
+            silence_start = None
+        elif has_speech and silence_start is None:
+            silence_start = time.time()
 
-        def callback(indata, frame_count, time_info, status):
-            if self.recording:
-                self.frames.append(indata.copy())
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS,
+        dtype="int16", callback=callback, blocksize=1024,
+    )
 
-        self.stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            callback=callback,
-            blocksize=1024,
-        )
-        self.stream.start()
+    with stream:
+        while recording:
+            time.sleep(0.05)
+            if time.time() - start_time > MAX_RECORD_SECONDS:
+                break
+            if has_speech and silence_start and (time.time() - silence_start) > SILENCE_DURATION:
+                break
+            if not has_speech and (time.time() - start_time) > 5.0:
+                log("🤷", "No speech detected", C.DIM)
+                tabbie("idle")
+                return None
 
-    def stop(self):
-        self.recording = False
-        if self.stream:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+    recording = False
 
-        if not self.frames:
-            return None
+    if not frames or not has_speech:
+        return None
 
-        import numpy as np
-        audio_data = np.concatenate(self.frames, axis=0)
+    audio = np.concatenate(frames, axis=0)
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    with wave.open(tmp.name, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio.tobytes())
 
-        # Save to WAV
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        with wave.open(tmp.name, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio_data.tobytes())
+    duration = len(audio) / SAMPLE_RATE
+    log("⏹️", f"{duration:.1f}s captured", C.DIM)
+    return tmp.name
 
-        duration = len(audio_data) / SAMPLE_RATE
-        log("⏹️", f"Captured {duration:.1f}s audio", C.DIM)
-        return tmp.name
-
-    def record_with_silence_detection(self) -> str | None:
-        """Record until silence is detected."""
-        import sounddevice as sd
-        import numpy as np
-
-        self.frames = []
-        self.recording = True
-        silence_start = None
-        has_speech = False
-        start_time = time.time()
-
-        log("🎙️", "Listening... (I'll stop when you stop talking)", C.RED)
-        tabbie_animation("focus", "Listening...")
-
-        def callback(indata, frame_count, time_info, status):
-            nonlocal silence_start, has_speech
-            if not self.recording:
-                return
-
-            self.frames.append(indata.copy())
-            amplitude = np.abs(indata).mean()
-
-            if amplitude > SILENCE_THRESHOLD:
-                has_speech = True
-                silence_start = None
-            elif has_speech and silence_start is None:
-                silence_start = time.time()
-
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            callback=callback,
-            blocksize=1024,
-        )
-
-        with stream:
-            while self.recording:
-                time.sleep(0.05)
-
-                # Safety timeout
-                if time.time() - start_time > MAX_RECORD_SECONDS:
-                    log("⏰", "Max recording time reached", C.YELLOW)
-                    break
-
-                # Silence detection: stop after SILENCE_DURATION of quiet
-                if has_speech and silence_start and (time.time() - silence_start) > SILENCE_DURATION:
-                    log("🤫", "Silence detected, processing...", C.DIM)
-                    break
-
-                # No speech after 5 seconds = probably false trigger
-                if not has_speech and (time.time() - start_time) > 5.0:
-                    log("🤷", "No speech detected, going back to listening", C.DIM)
-                    tabbie_animation("idle")
-                    return None
-
-        self.recording = False
-
-        if not self.frames or not has_speech:
-            return None
-
-        audio_data = np.concatenate(self.frames, axis=0)
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        with wave.open(tmp.name, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio_data.tobytes())
-
-        duration = len(audio_data) / SAMPLE_RATE
-        log("⏹️", f"Captured {duration:.1f}s audio", C.DIM)
-        return tmp.name
-
-# ── Wake Word Detection ─────────────────────────────────────────────────────
+# ── Wake Word ───────────────────────────────────────────────────────────────
 
 class WakeWordDetector:
-    """Listens for wake word using Picovoice Porcupine."""
-
     def __init__(self):
         self.porcupine = None
         self.recorder = None
 
-    def initialize(self):
+    def initialize(self) -> bool:
         try:
             import pvporcupine
             from pvrecorder import PvRecorder
         except ImportError:
-            log("❌", "Install: pip3 install pvporcupine pvrecorder", C.RED)
+            log("❌", "pip3 install pvporcupine pvrecorder", C.RED)
             return False
 
         if not PICOVOICE_API_KEY:
-            log("❌", "Set PICOVOICE_API_KEY (free at console.picovoice.ai)", C.RED)
+            log("❌", "Set PICOVOICE_API_KEY", C.RED)
             return False
 
         try:
-            # Try custom wake word file first, then built-in
             if WAKE_WORD_PATH and os.path.exists(WAKE_WORD_PATH):
-                log("🎯", f"Loading custom wake word: {WAKE_WORD_PATH}", C.MAGENTA)
                 self.porcupine = pvporcupine.create(
                     access_key=PICOVOICE_API_KEY,
                     keyword_paths=[WAKE_WORD_PATH],
                 )
             else:
-                log("🎯", f"Using built-in wake word: '{WAKE_WORD_BUILTIN}'", C.MAGENTA)
-                log("💡", "Train 'Overseer' at console.picovoice.ai for a custom wake word", C.DIM)
                 self.porcupine = pvporcupine.create(
                     access_key=PICOVOICE_API_KEY,
                     keywords=[WAKE_WORD_BUILTIN],
                 )
-
             self.recorder = PvRecorder(
-                frame_length=self.porcupine.frame_length,
-                device_index=-1,  # default mic
+                frame_length=self.porcupine.frame_length, device_index=-1,
             )
             return True
-
         except Exception as e:
-            log("❌", f"Porcupine init failed: {e}", C.RED)
+            log("❌", f"Porcupine: {e}", C.RED)
             return False
 
     def listen(self) -> bool:
-        """Block until wake word is detected. Returns True on detection."""
         if not self.porcupine or not self.recorder:
             return False
-
         self.recorder.start()
-
         try:
             while True:
                 pcm = self.recorder.read()
-                keyword_index = self.porcupine.process(pcm)
-
-                if keyword_index >= 0:
+                if self.porcupine.process(pcm) >= 0:
                     self.recorder.stop()
                     return True
-
         except KeyboardInterrupt:
             self.recorder.stop()
             return False
 
     def cleanup(self):
         if self.recorder:
-            try:
-                self.recorder.stop()
-            except Exception:
-                pass
+            try: self.recorder.stop()
+            except: pass
             self.recorder.delete()
         if self.porcupine:
             self.porcupine.delete()
 
-# ── Groq Whisper STT ────────────────────────────────────────────────────────
+# ── Sentence Splitter ───────────────────────────────────────────────────────
 
-def transcribe_groq(audio_path: str) -> str:
-    """Send audio to Groq Whisper API for transcription."""
-    if not GROQ_API_KEY:
-        log("❌", "Set GROQ_API_KEY environment variable", C.RED)
-        return ""
+def split_sentences(text_stream):
+    """Buffer streaming text and yield complete sentences."""
+    buffer = ""
+    # Match sentence endings: . ! ? followed by space or end
+    sentence_end = re.compile(r'[.!?]+[\s]|[.!?]+$')
 
-    log("🧠", "Transcribing via Groq Whisper...", C.YELLOW)
-    tabbie_animation("focus", "Thinking...")
+    for chunk in text_stream:
+        buffer += chunk
 
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        while True:
+            match = sentence_end.search(buffer)
+            if match:
+                end = match.end()
+                sentence = buffer[:end].strip()
+                buffer = buffer[end:]
+                if sentence:
+                    yield sentence
+            else:
+                break
 
-    with open(audio_path, "rb") as f:
-        resp = requests.post(
-            url,
-            headers=headers,
-            files={"file": ("audio.wav", f, "audio/wav")},
-            data={"model": "whisper-large-v3", "response_format": "json"},
-            timeout=30,
-        )
+    # Flush remaining
+    if buffer.strip():
+        yield buffer.strip()
 
-    if resp.status_code != 200:
-        log("❌", f"Groq error: {resp.status_code} {resp.text}", C.RED)
-        tabbie_animation("angry")
-        return ""
+# ── Main Conversation Loop ──────────────────────────────────────────────────
 
-    text = resp.json().get("text", "").strip()
-    log("📝", f"You said: \"{text}\"", C.CYAN)
-    return text
+def conversation_turn(tts: EdgeTTSPlayer):
+    """One full conversation turn: record → transcribe → stream response → speak."""
 
-# ── Overseer Communication ──────────────────────────────────────────────────
+    # Record
+    audio_path = record_with_silence()
+    if not audio_path:
+        return False  # No speech, no interrupt
 
-def send_to_overseer(text: str) -> str:
-    """Send message to Overseer via SSH to Pi gateway."""
-    log("🛰️", "Sending to Overseer...", C.YELLOW)
+    try:
+        text = transcribe(audio_path)
+    finally:
+        try: os.unlink(audio_path)
+        except: pass
 
-    curl_cmd = (
-        f"curl -s -X POST http://127.0.0.1:{GATEWAY_PORT}/api/sessions/send "
-        f"-H 'Content-Type: application/json' "
-        f"-H 'Authorization: Bearer {GATEWAY_TOKEN}' "
-        f"-d '{json.dumps({\"agentId\": OVERSEER_AGENT, \"message\": text, \"wait\": True, \"timeoutSeconds\": 60})}'"
+    if not text:
+        tabbie("idle")
+        return False
+
+    # Stream LLM response + speak sentences as they arrive
+    log("🛰️", "Overseer thinking...", C.YELLOW)
+    tts.reset()
+
+    # Start interrupt monitor
+    monitor = InterruptMonitor(tts)
+
+    full_response = ""
+    for sentence in split_sentences(stream_haiku(text)):
+        full_response += sentence + " "
+        log("🗣️", sentence, C.GREEN)
+
+        # Start monitoring for interrupts once TTS starts
+        monitor.start()
+
+        if not tts.speak_sentence(sentence):
+            # Interrupted!
+            monitor.stop()
+            log("🤚", "Stopped. Listening to you...", C.MAGENTA)
+            tabbie("idle")
+            return True  # Signal: user wants to speak again
+
+        monitor.stop()
+
+    if full_response:
+        log("🛰️", f"[{len(full_response.split())} words]", C.DIM)
+
+    tabbie("idle")
+    return False  # Normal completion
+
+
+# ── Push to Talk Mode ───────────────────────────────────────────────────────
+
+def record_push_to_talk() -> str | None:
+    """Hold SPACE to record. Release to stop."""
+    try:
+        import keyboard
+    except ImportError:
+        log("❌", "pip3 install keyboard", C.RED)
+        return None
+
+    frames = []
+    recording = True
+
+    log("🎙️", "Recording... (release SPACE to stop)", C.RED)
+    tabbie("focus", "Listening...")
+
+    def callback(indata, frame_count, time_info, status):
+        if recording:
+            frames.append(indata.copy())
+
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS,
+        dtype="int16", callback=callback, blocksize=1024,
     )
 
-    ssh_cmd = [
-        "ssh", "-o", "ConnectTimeout=5",
-        "-o", "StrictHostKeyChecking=no",
-        f"{PI_USER}@{PI_HOST}",
-        curl_cmd,
-    ]
+    with stream:
+        keyboard.wait("space", suppress=True, trigger_on_release=True)
 
-    try:
-        result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=90)
-        if result.returncode != 0:
-            log("❌", f"SSH error: {result.stderr.strip()}", C.RED)
-            tabbie_animation("angry")
-            return "Connection to Overseer failed."
+    recording = False
 
-        response = result.stdout.strip()
-        try:
-            data = json.loads(response)
-            reply = data.get("reply", data.get("message", data.get("text", response)))
-        except json.JSONDecodeError:
-            reply = response
+    if not frames:
+        return None
 
-        log("🛰️", f"Overseer: {reply}", C.GREEN)
-        return reply
+    audio = np.concatenate(frames, axis=0)
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    with wave.open(tmp.name, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio.tobytes())
 
-    except subprocess.TimeoutExpired:
-        log("⏰", "Timeout waiting for Overseer", C.RED)
-        tabbie_animation("angry")
-        return "Overseer didn't respond in time."
-    except Exception as e:
-        log("❌", f"Error: {e}", C.RED)
-        tabbie_animation("angry")
-        return f"Error: {e}"
+    return tmp.name
 
-# ── TTS ─────────────────────────────────────────────────────────────────────
+# ── Entry Points ────────────────────────────────────────────────────────────
 
-def speak(text: str):
-    """Speak text using macOS TTS."""
-    if not text:
-        return
-
-    log("🔊", "Speaking...", C.GREEN)
-    tabbie_animation("love", "Speaking")  # happy face while talking
-
-    clean = text.replace("'", "'\\''").replace('"', '\\"')
-
-    try:
-        subprocess.run(["say", "-v", TTS_VOICE, "-r", "180", clean], timeout=60)
-    except FileNotFoundError:
-        try:
-            subprocess.run(["espeak", clean], timeout=60)
-        except FileNotFoundError:
-            log("⚠️", "No TTS engine found", C.YELLOW)
-
-    tabbie_animation("idle")  # back to idle after speaking
-
-# ── Conversation Loop ───────────────────────────────────────────────────────
-
-def process_voice_input(recorder: AudioRecorder, use_silence_detection: bool = True):
-    """Record → Transcribe → Overseer → Speak. Full conversation turn."""
-    if use_silence_detection:
-        audio_path = recorder.record_with_silence_detection()
-    else:
-        # Push-to-talk: already started, just stop
-        audio_path = recorder.stop()
-
-    if not audio_path:
-        return
-
-    try:
-        # Transcribe
-        text = transcribe_groq(audio_path)
-    finally:
-        try:
-            os.unlink(audio_path)
-        except OSError:
-            pass
-
-    if not text:
-        tabbie_animation("idle")
-        return
-
-    # Send to Overseer
-    response = send_to_overseer(text)
-
-    # Speak response
-    speak(response)
-
-# ── Main ────────────────────────────────────────────────────────────────────
-
-def check_deps(mode: str):
-    """Check dependencies for the selected mode."""
-    missing = []
-
-    if not GROQ_API_KEY:
-        missing.append("GROQ_API_KEY (free at https://console.groq.com)")
-
-    if not GATEWAY_TOKEN:
-        missing.append("GATEWAY_TOKEN (from clawdbot gateway config)")
-
-    if mode == "wake-word" and not PICOVOICE_API_KEY:
-        missing.append("PICOVOICE_API_KEY (free at https://console.picovoice.ai)")
-
-    try:
-        import sounddevice
-    except ImportError:
-        missing.append("pip3 install sounddevice")
-
-    try:
-        import numpy
-    except ImportError:
-        missing.append("pip3 install numpy")
-
-    if mode == "wake-word":
-        try:
-            import pvporcupine
-            from pvrecorder import PvRecorder
-        except ImportError:
-            missing.append("pip3 install pvporcupine pvrecorder")
-
-    if mode == "push-to-talk":
-        try:
-            import keyboard
-        except ImportError:
-            missing.append("pip3 install keyboard (requires sudo on macOS)")
-
-    if missing:
-        log("❌", "Missing:", C.RED)
-        for m in missing:
-            print(f"   → {m}")
-        print()
-        return False
-    return True
-
-
-def run_wake_word_mode():
-    """Main loop: wake word → record with silence detection → process."""
+def run_wake_word():
     detector = WakeWordDetector()
     if not detector.initialize():
-        log("💡", "Falling back to push-to-talk mode", C.YELLOW)
-        run_push_to_talk_mode()
+        log("💡", "Falling back to push-to-talk", C.YELLOW)
+        run_push_to_talk()
         return
 
-    recorder = AudioRecorder()
-
-    # Check Tabbie connection
-    if TABBIE_ENABLED:
-        if tabbie_status():
-            log("🤖", f"Tabbie connected at {TABBIE_HOST}", C.GREEN)
-            tabbie_animation("idle")
-        else:
-            log("⚠️", f"Tabbie not found at {TABBIE_HOST} (continuing without)", C.YELLOW)
+    tts = EdgeTTSPlayer()
 
     wake_name = os.path.basename(WAKE_WORD_PATH).replace(".ppn", "") if WAKE_WORD_PATH else WAKE_WORD_BUILTIN
-    log("✅", f"Listening for wake word: \"{wake_name}\"", C.GREEN)
-    log("💡", "Say the wake word, then speak your message. ESC or Ctrl+C to quit.\n", C.DIM)
+    log("✅", f'Listening for "{wake_name}". Ctrl+C to quit.\n', C.GREEN)
+    tabbie("idle")
 
     try:
         while True:
-            # Wait for wake word
             detected = detector.listen()
             if not detected:
                 break
 
-            log("👂", "Wake word detected!", C.MAGENTA)
+            log("👂", "Wake word!", C.MAGENTA)
+            tabbie("startup")
+            time.sleep(0.2)
 
-            # Chime / visual feedback
-            tabbie_animation("startup", "Listening...")
-
-            # Small delay for the wake word audio to clear
-            time.sleep(0.3)
-
-            # Record with silence detection
-            process_voice_input(recorder, use_silence_detection=True)
+            # Conversation turn — may loop if interrupted
+            wants_more = True
+            while wants_more:
+                wants_more = conversation_turn(tts)
 
             print()
-            log("👂", f"Listening for \"{wake_name}\"...\n", C.DIM)
+            log("👂", f'Listening for "{wake_name}"...\n', C.DIM)
 
     except KeyboardInterrupt:
         pass
     finally:
         detector.cleanup()
-        tabbie_animation("idle")
-        log("👋", "Voice interface stopped.", C.DIM)
+        tabbie("idle")
+        log("👋", "Stopped.", C.DIM)
 
 
-def run_push_to_talk_mode():
-    """Fallback: hold SPACE to talk."""
+def run_push_to_talk():
     try:
         import keyboard
     except ImportError:
         log("❌", "pip3 install keyboard", C.RED)
         return
 
-    recorder = AudioRecorder()
-
-    if TABBIE_ENABLED and tabbie_status():
-        log("🤖", f"Tabbie connected at {TABBIE_HOST}", C.GREEN)
-        tabbie_animation("idle")
-
-    log("✅", f"Push-to-talk mode. Hold {HOTKEY.upper()} to talk. ESC to quit.\n", C.GREEN)
+    tts = EdgeTTSPlayer()
+    log("✅", "Hold SPACE to talk. ESC to quit.\n", C.GREEN)
+    tabbie("idle")
 
     def on_press(event):
-        if event.name == HOTKEY and not recorder.recording:
-            recorder.start()
+        if event.name != "space":
+            return
 
-    def on_release(event):
-        if event.name == HOTKEY and recorder.recording:
-            process_voice_input(recorder, use_silence_detection=False)
-            print()
-            log("✅", f"Hold {HOTKEY.upper()} to talk.\n", C.GREEN)
+        audio_path = record_push_to_talk()
+        if not audio_path:
+            return
+
+        try:
+            text = transcribe(audio_path)
+        finally:
+            try: os.unlink(audio_path)
+            except: pass
+
+        if not text:
+            tabbie("idle")
+            return
+
+        log("🛰️", "Overseer...", C.YELLOW)
+        tts.reset()
+        monitor = InterruptMonitor(tts)
+
+        for sentence in split_sentences(stream_haiku(text)):
+            log("🗣️", sentence, C.GREEN)
+            monitor.start()
+            if not tts.speak_sentence(sentence):
+                monitor.stop()
+                break
+            monitor.stop()
+
+        tabbie("idle")
+        print()
+        log("✅", "Hold SPACE to talk.\n", C.GREEN)
 
     keyboard.on_press(on_press)
-    keyboard.on_release(on_release)
 
     try:
         keyboard.wait("esc")
     except KeyboardInterrupt:
         pass
 
-    tabbie_animation("idle")
-    log("👋", "Voice interface stopped.", C.DIM)
+    tabbie("idle")
+    log("👋", "Stopped.", C.DIM)
+
+
+# ── Dependency Check ────────────────────────────────────────────────────────
+
+def check_deps(mode: str) -> bool:
+    missing = []
+
+    if not GROQ_API_KEY:
+        missing.append("GROQ_API_KEY (free: console.groq.com)")
+    if not ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY (for Haiku streaming)")
+    if mode == "wake-word" and not PICOVOICE_API_KEY:
+        missing.append("PICOVOICE_API_KEY (free: console.picovoice.ai)")
+
+    # Check edge-tts CLI
+    try:
+        subprocess.run(["edge-tts", "--version"], capture_output=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        missing.append("edge-tts not installed (pip3 install edge-tts)")
+
+    if mode == "push-to-talk":
+        try:
+            import keyboard
+        except ImportError:
+            missing.append("pip3 install keyboard")
+
+    if mode == "wake-word":
+        try:
+            import pvporcupine
+        except ImportError:
+            missing.append("pip3 install pvporcupine pvrecorder")
+
+    if missing:
+        log("❌", "Missing:", C.RED)
+        for m in missing:
+            print(f"   → {m}")
+        return False
+    return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Overseer Voice Interface")
-    parser.add_argument("--push-to-talk", action="store_true", help="Hold SPACE to talk (instead of wake word)")
-    parser.add_argument("--no-tabbie", action="store_true", help="Disable Tabbie integration")
+    parser = argparse.ArgumentParser(description="Overseer Voice Interface v2")
+    parser.add_argument("--push-to-talk", action="store_true")
+    parser.add_argument("--no-tabbie", action="store_true")
     args = parser.parse_args()
 
     global TABBIE_ENABLED
@@ -586,18 +715,21 @@ def main():
     mode = "push-to-talk" if args.push_to_talk else "wake-word"
 
     print(f"""
-{C.BOLD}🛰️  Overseer Voice Interface{C.RESET}
-{C.DIM}Mode: {"Wake Word" if mode == "wake-word" else "Push-to-Talk"}{C.RESET}
-{C.DIM}STT: Groq Whisper | Agent: Overseer | TTS: macOS | Tabbie: {"on" if TABBIE_ENABLED else "off"}{C.RESET}
+{C.BOLD}🛰️  Overseer Voice Interface v2{C.RESET}
+{C.DIM}Mode: {"Wake Word" if mode == "wake-word" else "Push-to-Talk"} | STT: Groq | LLM: Haiku (streaming) | TTS: Edge ({TTS_VOICE}){C.RESET}
+{C.DIM}Tabbie: {"on" if TABBIE_ENABLED else "off"} | Interrupts: on{C.RESET}
 """)
 
     if not check_deps(mode):
+        print(f"\n{C.YELLOW}Quick fix:{C.RESET}")
+        print("   pip3 install requests sounddevice numpy edge-tts pvporcupine pvrecorder")
+        print("   export GROQ_API_KEY=... ANTHROPIC_API_KEY=... PICOVOICE_API_KEY=...")
         sys.exit(1)
 
     if mode == "wake-word":
-        run_wake_word_mode()
+        run_wake_word()
     else:
-        run_push_to_talk_mode()
+        run_push_to_talk()
 
 
 if __name__ == "__main__":

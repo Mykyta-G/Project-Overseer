@@ -4,14 +4,14 @@
 
 # ── Required ──────────────────────────────────────────────────────
 
-# Groq API key (free at https://console.groq.com)
+# Groq API key — STT (free at https://console.groq.com)
 export GROQ_API_KEY="gsk_your_key_here"
 
-# Picovoice API key (free at https://console.picovoice.ai)
-export PICOVOICE_API_KEY="your_picovoice_key_here"
+# Anthropic API key — Haiku streaming (pay-as-you-go)
+export ANTHROPIC_API_KEY="sk-ant-your_key_here"
 
-# Clawdbot gateway auth token (from gateway config)
-export GATEWAY_TOKEN="your_gateway_token_here"
+# Picovoice API key — wake word (free at https://console.picovoice.ai)
+export PICOVOICE_API_KEY="your_picovoice_key_here"
 
 # ── Pi Connection ─────────────────────────────────────────────────
 
@@ -34,5 +34,11 @@ export TABBIE_ENABLED="true"
 
 # ── TTS ───────────────────────────────────────────────────────────
 
-# macOS voice (run `say -v ?` to list available voices)
-export TTS_VOICE="Samantha"
+# Edge TTS voice (run `edge-tts --list-voices` to see all)
+# Good options: en-US-GuyNeural, en-GB-RyanNeural, en-US-ChristopherNeural
+export TTS_VOICE="en-US-GuyNeural"
+
+# ── LLM ───────────────────────────────────────────────────────────
+
+# Haiku model for fast voice responses
+export HAIKU_MODEL="claude-haiku-4-5-20250414"
